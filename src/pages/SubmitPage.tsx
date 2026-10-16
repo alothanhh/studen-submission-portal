@@ -1,16 +1,63 @@
-import { useEffect, useState, type FormEvent } from 'react'
-import { Link } from 'react-router-dom'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
+import { flushSync } from 'react-dom'
 import { supabase } from '../lib/supabase'
-import type { ClassRow } from '../types'
-import { ACCEPTED_ACCEPT_ATTR, MAX_FILE_SIZE_BYTES, isAcceptedFile } from '../lib/fileRules'
+import { useDocumentTitle } from '../lib/useDocumentTitle'
+import type { ClassRow, StudentRow } from '../types'
+import {
+  ACCEPTED_ACCEPT_ATTR,
+  MAX_FILES_PER_SUBMISSION,
+  MAX_FILE_SIZE_BYTES,
+  getMimeType,
+  isAcceptedFile,
+} from '../lib/fileRules'
+import Alert from '../components/ui/Alert'
+import Button from '../components/ui/Button'
+import Card from '../components/ui/Card'
+import PageHeader from '../components/ui/PageHeader'
+import SelectField from '../components/ui/SelectField'
+import TextField from '../components/ui/TextField'
+import FileDropzone from '../components/FileDropzone'
+import SubmissionSuccess, { type SubmissionSummary } from '../components/SubmissionSuccess'
+import { UploadIcon } from '../components/ui/icons'
+
+interface FieldErrors {
+  classId?: string
+  studentName?: string
+  files?: string
+}
+
+function validateFile(file: File): string | undefined {
+  if (!isAcceptedFile(file)) {
+    return 'Chỉ chấp nhận file Excel (.xls, .xlsx), Word (.doc, .docx), PowerPoint (.ppt, .pptx) hoặc PDF (.pdf).'
+  }
+  if (file.size > MAX_FILE_SIZE_BYTES) return 'File vượt quá dung lượng tối đa 25MB.'
+  return undefined
+}
+
+function isSameFile(a: File, b: File): boolean {
+  return a.name === b.name && a.size === b.size && a.lastModified === b.lastModified
+}
 
 export default function SubmitPage() {
+  useDocumentTitle('Nộp bài tập')
   const [classes, setClasses] = useState<ClassRow[]>([])
   const [classId, setClassId] = useState('')
   const [studentName, setStudentName] = useState('')
-  const [file, setFile] = useState<File | null>(null)
+  const [roster, setRoster] = useState<StudentRow[]>([])
+  const [rosterLoading, setRosterLoading] = useState(false)
+  const [studentId, setStudentId] = useState('')
+  const [files, setFiles] = useState<File[]>([])
+  const [uploadedCount, setUploadedCount] = useState(0)
   const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle')
   const [errorMessage, setErrorMessage] = useState('')
+  const [fieldErrors, setFieldErrors] = useState<FieldErrors>({})
+  const [summary, setSummary] = useState<SubmissionSummary | null>(null)
+
+  const classRef = useRef<HTMLSelectElement>(null)
+  const nameRef = useRef<HTMLInputElement>(null)
+  const studentRef = useRef<HTMLSelectElement>(null)
+  const rosterRequest = useRef(0)
+  const fileRef = useRef<HTMLButtonElement>(null)
 
   useEffect(() => {
     supabase
@@ -26,51 +73,120 @@ export default function SubmitPage() {
       })
   }, [])
 
+  async function handleClassChange(nextClassId: string) {
+    setClassId(nextClassId)
+    setStudentId('')
+    setRoster([])
+    setFieldErrors((prev) => ({ ...prev, classId: undefined, studentName: undefined }))
+    setRosterLoading(true)
+
+    // Ignore responses for a class the student has already switched away from.
+    const requestId = ++rosterRequest.current
+    const { data, error } = await supabase
+      .from('students')
+      .select('id, class_id, roll_number, full_name')
+      .eq('class_id', nextClassId)
+      .order('roll_number', { ascending: true })
+    if (requestId !== rosterRequest.current) return
+
+    setRosterLoading(false)
+    if (error) {
+      setErrorMessage(`Không tải được danh sách học sinh: ${error.message}`)
+      return
+    }
+    setRoster(data ?? [])
+  }
+
+  function handleAddFiles(picked: File[]) {
+    // Validate on pick; invalid files and files over the limit are rejected so they can't be submitted.
+    const next = [...files]
+    const problems: string[] = []
+    for (const candidate of picked) {
+      if (next.some((f) => isSameFile(f, candidate))) continue
+      const fileError = validateFile(candidate)
+      if (fileError) {
+        problems.push(`"${candidate.name}": ${fileError}`)
+        continue
+      }
+      if (next.length >= MAX_FILES_PER_SUBMISSION) {
+        problems.push(`Chỉ được nộp tối đa ${MAX_FILES_PER_SUBMISSION} file.`)
+        break
+      }
+      next.push(candidate)
+    }
+    setFiles(next)
+    setFieldErrors((prev) => ({
+      ...prev,
+      files: problems.length > 1 ? `${problems[0]} (và ${problems.length - 1} lỗi khác)` : problems[0],
+    }))
+  }
+
+  function handleRemoveFile(index: number) {
+    setFiles((prev) => prev.filter((_, i) => i !== index))
+    setFieldErrors((prev) => ({ ...prev, files: undefined }))
+  }
+
+  const submitting = status === 'loading'
+  const hasRoster = roster.length > 0
+
   async function handleSubmit(e: FormEvent) {
     e.preventDefault()
     setErrorMessage('')
 
-    if (!classId) {
-      setErrorMessage('Vui lòng chọn lớp.')
-      return
+    const errors: FieldErrors = {
+      classId: classId ? undefined : 'Vui lòng chọn lớp.',
+      studentName: !classId
+        ? undefined
+        : hasRoster
+          ? studentId
+            ? undefined
+            : 'Vui lòng chọn tên của bạn.'
+          : studentName.trim()
+            ? undefined
+            : 'Vui lòng nhập họ tên.',
+      files: files.length === 0 ? 'Vui lòng chọn ít nhất 1 file bài làm.' : undefined,
     }
-    if (!studentName.trim()) {
-      setErrorMessage('Vui lòng nhập họ tên.')
-      return
-    }
-    if (!file) {
-      setErrorMessage('Vui lòng chọn file bài làm.')
-      return
-    }
-    if (!isAcceptedFile(file)) {
-      setErrorMessage('Chỉ chấp nhận file Excel (.xls, .xlsx), Word (.doc, .docx) hoặc PowerPoint (.ppt, .pptx).')
-      return
-    }
-    if (file.size > MAX_FILE_SIZE_BYTES) {
-      setErrorMessage('File vượt quá dung lượng tối đa 25MB.')
-      return
-    }
+    flushSync(() => setFieldErrors(errors))
+
+    if (errors.classId) return classRef.current?.focus()
+    if (errors.studentName) return (hasRoster ? studentRef : nameRef).current?.focus()
+    if (errors.files) return fileRef.current?.focus()
 
     setStatus('loading')
+    setUploadedCount(0)
 
-    const timestamp = Date.now()
-    const safeFileName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_')
-    const path = `${classId}/${timestamp}_${safeFileName}`
+    const finalName = hasRoster ? (roster.find((r) => r.id === studentId)?.full_name ?? '') : studentName.trim()
 
-    const { error: uploadError } = await supabase.storage.from('submissions').upload(path, file)
+    // The client picks the id: anon users can't read submissions back after insert.
+    const submissionId = crypto.randomUUID()
+    let completed = 0
 
-    if (uploadError) {
+    const results = await Promise.all(
+      files.map(async (file, index) => {
+        const safeFileName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_')
+        const path = `${classId}/${submissionId}/${index}_${safeFileName}`
+        const { error } = await supabase.storage
+          .from('submissions')
+          .upload(path, file, { contentType: getMimeType(file.name) })
+        completed += 1
+        setUploadedCount(completed)
+        return { file, path, error }
+      }),
+    )
+
+    const failed = results.find((r) => r.error)
+    if (failed?.error) {
       setStatus('error')
-      setErrorMessage(`Tải file lên thất bại: ${uploadError.message}`)
+      setErrorMessage(`Tải file "${failed.file.name}" lên thất bại: ${failed.error.message}`)
       return
     }
 
-    const { error: insertError } = await supabase.from('submissions').insert({
-      class_id: classId,
-      student_name: studentName.trim(),
-      file_path: path,
-      file_name: file.name,
-      file_size: file.size,
+    const { error: insertError } = await supabase.rpc('create_submission', {
+      p_id: submissionId,
+      p_class_id: classId,
+      p_student_name: finalName,
+      p_student_id: hasRoster ? studentId : null,
+      p_files: results.map((r) => ({ file_path: r.path, file_name: r.file.name })),
     })
 
     if (insertError) {
@@ -79,108 +195,121 @@ export default function SubmitPage() {
       return
     }
 
+    setSummary({
+      className: classes.find((c) => c.id === classId)?.name ?? '—',
+      studentName: finalName,
+      fileNames: files.map((f) => f.name),
+      submittedAt: new Date(),
+    })
     setStatus('success')
     setStudentName('')
-    setFile(null)
+    setStudentId('')
+    setRoster([])
+    setFiles([])
     setClassId('')
-    const fileInput = document.getElementById('file-input') as HTMLInputElement | null
-    if (fileInput) fileInput.value = ''
   }
 
+
   return (
-    <div className="flex min-h-screen flex-col items-center justify-center gap-4 p-4">
-      <div className="w-full max-w-md rounded-2xl border border-slate-100 bg-white/90 p-8 shadow-xl shadow-indigo-100 backdrop-blur">
-        <div className="mb-6 flex items-center gap-3">
-          <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-linear-to-br from-indigo-500 to-violet-500 text-xl text-white shadow-md shadow-indigo-200">
-            📤
-          </div>
-          <div>
-            <h1 className="text-xl font-bold text-slate-900">Nộp bài tập</h1>
-            <p className="text-sm text-slate-500">Chọn lớp và tải lên file bài làm của bạn</p>
-          </div>
-        </div>
+    <Card padding="lg" className="w-full max-w-md">
+      <PageHeader
+        icon={<UploadIcon />}
+        title="Nộp bài tập"
+        subtitle="Chọn lớp và tải lên file bài làm của bạn"
+        className="mb-6"
+      />
 
-        {status === 'success' ? (
-          <div className="flex flex-col items-start gap-3 rounded-xl border border-emerald-200 bg-emerald-50 p-5 text-emerald-800">
-            <div className="flex items-center gap-2 font-semibold">
-              <span className="flex h-8 w-8 items-center justify-center rounded-full bg-emerald-500 text-white">✓</span>
-              Nộp bài thành công! Cảm ơn bạn.
-            </div>
-            <button
-              className="rounded-lg bg-white px-4 py-2 text-sm font-semibold text-emerald-700 shadow-sm ring-1 ring-emerald-200 transition hover:bg-emerald-100"
-              onClick={() => setStatus('idle')}
+      {status === 'success' && summary ? (
+        <SubmissionSuccess summary={summary} onSubmitAnother={() => setStatus('idle')} />
+      ) : (
+        <form onSubmit={handleSubmit} noValidate className="flex flex-col gap-4">
+          <SelectField
+            ref={classRef}
+            label="Lớp"
+            value={classId}
+            onChange={(e) => handleClassChange(e.target.value)}
+            error={fieldErrors.classId}
+            disabled={submitting}
+            required
+          >
+            <option value="" disabled>
+              -- Chọn lớp --
+            </option>
+            {classes.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.name}
+              </option>
+            ))}
+          </SelectField>
+
+          {!classId || rosterLoading ? (
+            <SelectField label="Họ và tên" value="" disabled>
+              <option value="">{rosterLoading ? 'Đang tải danh sách lớp...' : '-- Chọn lớp trước --'}</option>
+            </SelectField>
+          ) : hasRoster ? (
+            <SelectField
+              ref={studentRef}
+              label="Họ và tên"
+              value={studentId}
+              onChange={(e) => {
+                setStudentId(e.target.value)
+                setFieldErrors((prev) => ({ ...prev, studentName: undefined }))
+              }}
+              hint="Không thấy tên của bạn? Hãy báo giáo viên."
+              error={fieldErrors.studentName}
+              disabled={submitting}
+              required
             >
-              Nộp bài khác
-            </button>
-          </div>
-        ) : (
-          <form onSubmit={handleSubmit} className="flex flex-col gap-4">
-            <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
-              <span>Lớp</span>
-              <select
-                value={classId}
-                onChange={(e) => setClassId(e.target.value)}
-                required
-                className="rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-slate-800 outline-none transition focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100"
-              >
-                <option value="" disabled>
-                  -- Chọn lớp --
+              <option value="" disabled>
+                -- Chọn tên của bạn --
+              </option>
+              {roster.map((r) => (
+                <option key={r.id} value={r.id}>
+                  {r.roll_number}. {r.full_name}
                 </option>
-                {classes.map((c) => (
-                  <option key={c.id} value={c.id}>
-                    {c.name}
-                  </option>
-                ))}
-              </select>
-            </label>
+              ))}
+            </SelectField>
+          ) : (
+            <TextField
+              ref={nameRef}
+              label="Họ và tên"
+              value={studentName}
+              onChange={(e) => {
+                setStudentName(e.target.value)
+                setFieldErrors((prev) => ({ ...prev, studentName: undefined }))
+              }}
+              placeholder="Nguyễn Văn A"
+              autoComplete="name"
+              error={fieldErrors.studentName}
+              disabled={submitting}
+              required
+            />
+          )}
 
-            <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
-              <span>Họ và tên</span>
-              <input
-                type="text"
-                value={studentName}
-                onChange={(e) => setStudentName(e.target.value)}
-                placeholder="Nguyễn Văn A"
-                required
-                className="rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-slate-800 outline-none transition placeholder:text-slate-400 focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100"
-              />
-            </label>
+          <FileDropzone
+            ref={fileRef}
+            label="File bài làm"
+            hint={`Tối đa ${MAX_FILES_PER_SUBMISSION} file, mỗi file không quá 25MB. Chấp nhận: .xlsx, .xls, .doc, .docx, .ppt, .pptx, .pdf`}
+            accept={ACCEPTED_ACCEPT_ATTR}
+            files={files}
+            maxFiles={MAX_FILES_PER_SUBMISSION}
+            onAddFiles={handleAddFiles}
+            onRemoveFile={handleRemoveFile}
+            error={fieldErrors.files}
+            disabled={submitting}
+          />
 
-            <label className="flex flex-col gap-1.5 text-sm font-medium text-slate-700">
-              <span>File bài làm</span>
-              <input
-                id="file-input"
-                type="file"
-                accept={ACCEPTED_ACCEPT_ATTR}
-                onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-                required
-                className="cursor-pointer rounded-lg border border-dashed border-slate-300 bg-slate-50 px-3 py-2.5 text-sm text-slate-600 outline-none transition file:mr-3 file:cursor-pointer file:rounded-md file:border-0 file:bg-indigo-600 file:px-3 file:py-1.5 file:text-sm file:font-semibold file:text-white hover:file:bg-indigo-500 focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100"
-              />
-              <small className="font-normal text-slate-400">Chấp nhận: .xlsx, .xls, .doc, .docx, .ppt, .pptx (tối đa 25MB)</small>
-            </label>
+          {errorMessage && <Alert tone="danger">{errorMessage}</Alert>}
 
-            {errorMessage && (
-              <div className="rounded-lg border border-rose-200 bg-rose-50 px-3.5 py-2.5 text-sm text-rose-700">
-                {errorMessage}
-              </div>
-            )}
-
-            <button
-              className="mt-1 rounded-lg bg-linear-to-r from-indigo-600 to-violet-600 px-4 py-2.5 text-sm font-semibold text-white shadow-md shadow-indigo-200 transition hover:from-indigo-500 hover:to-violet-500 disabled:cursor-not-allowed disabled:opacity-60"
-              type="submit"
-              disabled={status === 'loading'}
-            >
-              {status === 'loading' ? 'Đang nộp...' : 'Nộp bài'}
-            </button>
-          </form>
-        )}
-      </div>
-
-      <p className="text-sm text-slate-500">
-        <Link to="/portal/login" className="font-medium text-indigo-600 transition hover:text-indigo-700">
-          Đăng nhập dành cho giáo viên
-        </Link>
-      </p>
-    </div>
+          <Button type="submit" className="mt-1" loading={submitting}>
+            {!submitting
+              ? 'Nộp bài'
+              : uploadedCount < files.length
+                ? `Đang tải lên ${uploadedCount}/${files.length} file...`
+                : 'Đang lưu bài nộp...'}
+          </Button>
+        </form>
+      )}
+    </Card>
   )
 }
